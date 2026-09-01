@@ -2,7 +2,7 @@
 title Alterar pasta de destino - Impressora PDF Virtual
 color 0B
 
-set "APP_FOLDER=%LOCALAPPDATA%\PDFVirtualPrinter"
+set "APP_FOLDER=%ProgramData%\PDFVirtualPrinter"
 set "CONFIG_FILE=%APP_FOLDER%\config.ini"
 
 if not exist "%APP_FOLDER%" (

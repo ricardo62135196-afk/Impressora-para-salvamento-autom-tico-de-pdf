@@ -28,16 +28,17 @@ echo.
 :: ============================================================
 set "PRINTER_NAME=Impressora PDF Virtual"
 set "PORT_NAME=PDF_VIRTUAL_PORT:"
-set "APP_FOLDER=%LOCALAPPDATA%\PDFVirtualPrinter"
+set "APP_FOLDER=%ProgramData%\PDFVirtualPrinter"
 set "SPOOL_FOLDER=%APP_FOLDER%\spool"
 set "PORT_FILE=%SPOOL_FOLDER%\job.ps"
 set "CONFIG_FILE=%APP_FOLDER%\config.ini"
 set "MONITOR_SCRIPT=%APP_FOLDER%\monitor_pdf.ps1"
-set "STARTUP_SHORTCUT=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Monitor PDF Virtual.lnk"
 
 echo [1/9] Criando pastas de trabalho...
 if not exist "%APP_FOLDER%" mkdir "%APP_FOLDER%"
 if not exist "%SPOOL_FOLDER%" mkdir "%SPOOL_FOLDER%"
+echo       Liberando permissao de escrita para qualquer usuario...
+icacls "%APP_FOLDER%" /grant *S-1-5-32-545:(OI)(CI)M /T >nul 2>&1
 echo       [OK] Pastas criadas em: %APP_FOLDER%
 echo.
 
@@ -158,20 +159,20 @@ echo Write-Host "Config: $ConfigFile" -ForegroundColor Yellow
 echo.
 echo function Get-DestFolder {
 echo     $linha = Get-Content $ConfigFile ^| Where-Object { $_ -like "SaveFolder=*" }
-echo     if (-not $linha) { return "$env:USERPROFILE\Documents\PDFs" }
+echo     if ^(-not $linha^) { return "$env:USERPROFILE\Documents\PDFs" }
 echo     $folder = $linha -replace "^SaveFolder=", ""
-echo     if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force ^| Out-Null }
+echo     if ^(-not ^(Test-Path $folder^)^) { New-Item -ItemType Directory -Path $folder -Force ^| Out-Null }
 echo     return $folder
 echo }
 echo.
 echo function Wait-FileReady {
-echo     param($Path)
+echo     param^($Path^)
 echo     $pronto = $false
-echo     while (-not $pronto) {
+echo     while ^(-not $pronto^) {
 echo         Start-Sleep -Milliseconds 800
 echo         try {
-echo             $s = [System.IO.File]::Open($Path, 'Open', 'ReadWrite', 'None')
-echo             $s.Close()
+echo             $s = [System.IO.File]::Open^($Path, 'Open', 'ReadWrite', 'None'^)
+echo             $s.Close^(^)
 echo             $pronto = $true
 echo         } catch {
 echo             $pronto = $false
@@ -181,8 +182,8 @@ echo }
 echo.
 echo Write-Host "Monitor ativo. Aguardando impressoes..." -ForegroundColor Green
 echo.
-echo while ($true) {
-echo     if (Test-Path $PortFile) {
+echo while ^($true^) {
+echo     if ^(Test-Path $PortFile^) {
 echo         Wait-FileReady -Path $PortFile
 echo         Start-Sleep -Milliseconds 500
 echo.
@@ -190,7 +191,7 @@ echo         $destFolder = Get-DestFolder
 echo         $timestamp  = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 echo         $pdfPath    = Join-Path $destFolder "Documento_$timestamp.pdf"
 echo.
-echo         $gsArgs = @(
+echo         $gsArgs = @^(
 echo             "-dNOPAUSE", "-dBATCH", "-dSAFER",
 echo             "-sDEVICE=pdfwrite",
 echo             "-dCompatibilityLevel=1.7",
@@ -200,7 +201,7 @@ echo             "-dSubsetFonts=true",
 echo             "-dAutoRotatePages=/None",
 echo             "-sOutputFile=$pdfPath",
 echo             "$PortFile"
-echo         )
+echo         ^)
 echo.
 echo         try {
 echo             Start-Process -FilePath $GS -ArgumentList $gsArgs -NoNewWindow -Wait
@@ -208,7 +209,7 @@ echo         } catch {
 echo             Write-Host "[ERRO] Falha ao converter: $_" -ForegroundColor Red
 echo         }
 echo.
-echo         if ((Test-Path $pdfPath) -and ((Get-Item $pdfPath).Length -gt 1024)) {
+echo         if ^(^(Test-Path $pdfPath^) -and ^(^(Get-Item $pdfPath^).Length -gt 1024^)^) {
 echo             Write-Host "[OK] PDF salvo: $pdfPath" -ForegroundColor Green
 echo         } else {
 echo             Write-Host "[ERRO] PDF nao foi gerado corretamente" -ForegroundColor Red
@@ -228,11 +229,12 @@ echo.
 :: ============================================================
 echo [9/9] Configurando inicializacao automatica do monitor...
 powershell -NoProfile -Command ^
-    "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('%STARTUP_SHORTCUT%');" ^
-    "$s.TargetPath = 'powershell.exe';" ^
-    "$s.Arguments = '-WindowStyle Hidden -ExecutionPolicy Bypass -File \"%MONITOR_SCRIPT%\"';" ^
-    "$s.WorkingDirectory = '%APP_FOLDER%';" ^
-    "$s.Save()"
+    "$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-WindowStyle Hidden -ExecutionPolicy Bypass -File \"%MONITOR_SCRIPT%\"' -WorkingDirectory '%APP_FOLDER%';" ^
+    "$trigger = New-ScheduledTaskTrigger -AtLogOn;" ^
+    "$principal = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited;" ^
+    "Unregister-ScheduledTask -TaskName 'Monitor PDF Virtual' -Confirm:$false -ErrorAction SilentlyContinue;" ^
+    "Register-ScheduledTask -TaskName 'Monitor PDF Virtual' -Action $action -Trigger $trigger -Principal $principal -Description 'Monitor de conversao de PDF' -Force | Out-Null;" ^
+    "Write-Host 'Tarefa agendada criada: Monitor PDF Virtual (roda para qualquer usuario)'"
 echo       [OK] Monitor sera iniciado automaticamente ao ligar o PC
 echo.
 
