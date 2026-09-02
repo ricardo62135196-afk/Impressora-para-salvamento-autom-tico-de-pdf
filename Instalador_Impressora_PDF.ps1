@@ -4,7 +4,7 @@
 #>
 
 param(
-    [ValidateSet('Install','AlterarPasta')]
+    [ValidateSet('Install','AlterarPasta','Uninstall')]
     [string]$Action
 )
 
@@ -274,14 +274,82 @@ function Set-DestinationFolder {
     Read-Host "Pressione Enter para fechar"
 }
 
+function Uninstall-Printer {
+    Write-Host "================================================================"
+    Write-Host "   DESINSTALAR - IMPRESSORA VIRTUAL PDF"
+    Write-Host "================================================================"
+    Write-Host ""
+
+    if (-not (Test-IsAdmin)) {
+        Write-Host "[ERRO] Este processo precisa ser executado como Administrador." -ForegroundColor Red
+        Read-Host "Pressione Enter para sair"
+        return
+    }
+
+    $confirmar = [System.Windows.Forms.MessageBox]::Show(
+        "Tem certeza que deseja desinstalar a Impressora PDF Virtual?",
+        "Confirmar desinstalacao",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($confirmar -ne [System.Windows.Forms.DialogResult]::Yes) {
+        Write-Host "[AVISO] Desinstalacao cancelada." -ForegroundColor Yellow
+        Read-Host "Pressione Enter para sair"
+        return
+    }
+
+    Write-Host "[1/5] Parando o monitor em execucao..."
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*monitor_pdf.ps1*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Write-Host "      [OK] Monitor parado" -ForegroundColor Green
+    Write-Host ""
+
+    Write-Host "[2/5] Removendo impressora e porta..."
+    Remove-Printer -Name $PRINTER_NAME -ErrorAction SilentlyContinue
+    Remove-PrinterPort -Name $PORT_FILE -ErrorAction SilentlyContinue
+    Write-Host "      [OK] Impressora e porta removidas" -ForegroundColor Green
+    Write-Host ""
+
+    Write-Host "[3/5] Removendo inicializacao automatica..."
+    Unregister-ScheduledTask -TaskName 'Monitor PDF Virtual' -Confirm:$false -ErrorAction SilentlyContinue
+    $wsh = New-Object -ComObject WScript.Shell
+    $startupFolder = $wsh.SpecialFolders('AllUsersStartup')
+    $shortcutPath = Join-Path $startupFolder 'Monitor PDF Virtual.lnk'
+    Remove-Item $shortcutPath -Force -ErrorAction SilentlyContinue
+    Write-Host "      [OK] Atalho de inicializacao removido" -ForegroundColor Green
+    Write-Host ""
+
+    Write-Host "[4/5] Arquivos e configuracoes..."
+    $removerDados = [System.Windows.Forms.MessageBox]::Show(
+        "Deseja tambem apagar os arquivos de configuracao e a pasta de destino salva ($APP_FOLDER)?" + [Environment]::NewLine + "Isso remove a memoria da pasta onde os PDFs eram salvos.",
+        "Remover configuracoes",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($removerDados -eq [System.Windows.Forms.DialogResult]::Yes) {
+        Remove-Item $APP_FOLDER -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "      [OK] Pasta $APP_FOLDER removida" -ForegroundColor Green
+    } else {
+        Write-Host "      [OK] Configuracoes mantidas em $APP_FOLDER" -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    Write-Host "[5/5] Concluido"
+    Write-Host "================================================================"
+    Write-Host "   DESINSTALACAO CONCLUIDA!"
+    Write-Host "================================================================"
+    Write-Host ""
+    Read-Host "Pressione Enter para fechar"
+}
+
 # --- Execucao direta de uma acao especifica (usado apos auto-elevacao) ---
 if ($Action -eq 'Install') { Install-Printer; exit }
 if ($Action -eq 'AlterarPasta') { Set-DestinationFolder; exit }
+if ($Action -eq 'Uninstall') { Uninstall-Printer; exit }
 
 # --- Interface grafica principal ---
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Impressora PDF Virtual"
-$form.Size = New-Object System.Drawing.Size(420, 260)
+$form.Size = New-Object System.Drawing.Size(420, 310)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
@@ -321,10 +389,21 @@ $btnAlterar.Add_Click({
 })
 $form.Controls.Add($btnAlterar)
 
+$btnDesinstalar = New-Object System.Windows.Forms.Button
+$btnDesinstalar.Text = "Desinstalar"
+$btnDesinstalar.Size = New-Object System.Drawing.Size(360, 45)
+$btnDesinstalar.Location = New-Object System.Drawing.Point(20, 200)
+$btnDesinstalar.Add_Click({
+    $form.Hide()
+    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Uninstall" -Wait
+    $form.Show()
+})
+$form.Controls.Add($btnDesinstalar)
+
 $btnSair = New-Object System.Windows.Forms.Button
 $btnSair.Text = "Sair"
 $btnSair.Size = New-Object System.Drawing.Size(360, 30)
-$btnSair.Location = New-Object System.Drawing.Point(20, 195)
+$btnSair.Location = New-Object System.Drawing.Point(20, 250)
 $btnSair.Add_Click({ $form.Close() })
 $form.Controls.Add($btnSair)
 
