@@ -4,7 +4,7 @@
 #>
 
 param(
-    [ValidateSet('Install','AlterarPasta','Uninstall')]
+    [ValidateSet('Install','AlterarPasta','Uninstall','NamePattern')]
     [string]$Action
 )
 
@@ -38,6 +38,37 @@ function Find-Ghostscript {
     return $null
 }
 
+function Find-Tesseract {
+    $t = Get-Command tesseract -ErrorAction SilentlyContinue
+    if ($t) { return $t.Source }
+    $candidatos = @(
+        "C:\Program Files\Tesseract-OCR\tesseract.exe",
+        "C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"
+    )
+    foreach ($c in $candidatos) {
+        if (Test-Path $c) { return $c }
+    }
+    return $null
+}
+
+function Get-ConfigValue {
+    param($Key)
+    if (-not (Test-Path $CONFIG_FILE)) { return $null }
+    $linha = Get-Content $CONFIG_FILE | Where-Object { $_ -like "$Key=*" }
+    if ($linha) { return ($linha -replace "^$Key=", "") }
+    return $null
+}
+
+function Set-ConfigValue {
+    param($Key, $Value)
+    $linhas = @()
+    if (Test-Path $CONFIG_FILE) {
+        $linhas = @(Get-Content $CONFIG_FILE | Where-Object { $_ -notlike "$Key=*" -and $_.Trim() -ne "" })
+    }
+    $linhas += "$Key=$Value"
+    Set-Content -Path $CONFIG_FILE -Value $linhas -Encoding ASCII
+}
+
 function Install-Printer {
     Write-Host "================================================================"
     Write-Host "   INSTALADOR - IMPRESSORA VIRTUAL PDF"
@@ -54,7 +85,7 @@ function Install-Printer {
     New-Item -ItemType Directory -Path $APP_FOLDER -Force | Out-Null
     New-Item -ItemType Directory -Path $SPOOL_FOLDER -Force | Out-Null
     Write-Host "      Liberando permissao de escrita para qualquer usuario..."
-    icacls $APP_FOLDER /grant *S-1-5-32-545:(OI)(CI)M /T | Out-Null
+    icacls $APP_FOLDER /grant "*S-1-5-32-545:(OI)(CI)M" /T | Out-Null
     Write-Host "      [OK] Pastas criadas em: $APP_FOLDER" -ForegroundColor Green
     Write-Host ""
 
@@ -69,6 +100,16 @@ function Install-Printer {
     Write-Host "      [OK] Ghostscript encontrado: $GS_PATH" -ForegroundColor Green
     Write-Host ""
 
+    Write-Host "Verificando Tesseract OCR (opcional, usado na nomeacao automatica)..."
+    $TESS_PATH = Find-Tesseract
+    if ($TESS_PATH) {
+        Write-Host "      [OK] Tesseract encontrado: $TESS_PATH" -ForegroundColor Green
+    } else {
+        Write-Host "      [AVISO] Tesseract nao encontrado. A nomeacao automatica dos PDFs nao vai funcionar" -ForegroundColor Yellow
+        Write-Host "               ate instalar em https://github.com/UB-Mannheim/tesseract/wiki" -ForegroundColor Yellow
+    }
+    Write-Host ""
+
     Write-Host "[3/9] Escolha a pasta onde os PDFs serao salvos..."
     $picker = New-Object System.Windows.Forms.FolderBrowserDialog
     $picker.Description = "Selecione a pasta onde os PDFs impressos serao salvos"
@@ -81,14 +122,17 @@ function Install-Printer {
         Write-Host "      [AVISO] Nenhuma pasta selecionada. Usando pasta padrao." -ForegroundColor Yellow
     }
     Write-Host "      [OK] PDFs serao salvos em: $DEST_FOLDER" -ForegroundColor Green
-    Set-Content -Path $CONFIG_FILE -Value "SaveFolder=$DEST_FOLDER" -Encoding ASCII
+    Set-ConfigValue -Key "SaveFolder" -Value $DEST_FOLDER
     Write-Host ""
 
     Write-Host "[4/9] Limpando instalacao anterior, se houver..."
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*monitor_pdf.ps1*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Remove-Printer -Name $PRINTER_NAME -ErrorAction SilentlyContinue
     Remove-PrinterPort -Name $PORT_FILE -ErrorAction SilentlyContinue
     Remove-Item $PORT_FILE -Force -ErrorAction SilentlyContinue
-    Write-Host "      [OK] Limpeza concluida" -ForegroundColor Green
+    Write-Host "      [OK] Limpeza concluida (monitor antigo parado, impressora e porta removidas)" -ForegroundColor Green
     Write-Host ""
 
     Write-Host "[5/9] Criando porta local..."
@@ -120,6 +164,8 @@ function Install-Printer {
 `$PortFile   = "$PORT_FILE"
 `$ConfigFile = "$CONFIG_FILE"
 `$GS         = "$GS_PATH"
+`$AppFolder  = "$APP_FOLDER"
+`$Tesseract  = "$TESS_PATH"
 
 Write-Host "=== MONITOR IMPRESSORA PDF VIRTUAL ===" -ForegroundColor Green
 Write-Host "Arquivo de porta: `$PortFile" -ForegroundColor Yellow
@@ -146,6 +192,44 @@ function Wait-FileReady {
             `$pronto = `$false
         }
     }
+}
+
+function Get-NamePatterns {
+    if (-not (Test-Path `$ConfigFile)) { return @() }
+    `$linha = Get-Content `$ConfigFile | Where-Object { `$_ -like "NamePatterns=*" }
+    if (-not `$linha) { return @() }
+    `$valor = (`$linha -replace "^NamePatterns=", "").Trim()
+    if (`$valor -eq "") { return @() }
+    return @(`$valor -split '\|\|\|' | ForEach-Object { `$_.Trim() } | Where-Object { `$_ -ne "" })
+}
+
+function Remove-Diacritics {
+    param(`$Texto)
+    `$normalizado = `$Texto.Normalize([Text.NormalizationForm]::FormD)
+    `$sb = New-Object System.Text.StringBuilder
+    foreach (`$ch in `$normalizado.ToCharArray()) {
+        if ([Globalization.CharUnicodeInfo]::GetUnicodeCategory(`$ch) -ne [Globalization.UnicodeCategory]::NonSpacingMark) {
+            [void]`$sb.Append(`$ch)
+        }
+    }
+    return `$sb.ToString().Normalize([Text.NormalizationForm]::FormC)
+}
+
+function Get-FlexPattern {
+    param(`$Texto)
+    `$chars = `$Texto.ToCharArray() | ForEach-Object { [RegEx]::Escape([string]`$_) }
+    return (`$chars -join '\s*')
+}
+
+function Get-SanitizedName {
+    param(`$Texto)
+    `$invalidos = [IO.Path]::GetInvalidFileNameChars() -join ''
+    `$regexInvalidos = "[{0}]" -f [RegEx]::Escape(`$invalidos)
+    `$limpo = (`$Texto -replace `$regexInvalidos, '_').Trim()
+    `$limpo = `$limpo -replace '\s+', ' '
+    if (`$limpo.Length -gt 60) { `$limpo = `$limpo.Substring(0, 60).Trim() }
+    if (`$limpo -eq "") { return `$null }
+    return `$limpo
 }
 
 Write-Host "Monitor ativo. Aguardando impressoes..." -ForegroundColor Green
@@ -178,6 +262,126 @@ while (`$true) {
         }
 
         if ((Test-Path `$pdfPath) -and ((Get-Item `$pdfPath).Length -gt 1024)) {
+            `$padroes = Get-NamePatterns
+            if (`$padroes.Count -gt 0) {
+                `$diag = New-Object System.Text.StringBuilder
+                [void]`$diag.AppendLine("=== DIAGNOSTICO DE NOMEACAO AUTOMATICA (OCR) ===")
+                [void]`$diag.AppendLine("Data/hora: `$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+                [void]`$diag.AppendLine("PDF processado: `$pdfPath")
+                [void]`$diag.AppendLine("Rotulos configurados: `$(`$padroes -join ' | ')")
+                [void]`$diag.AppendLine("Tesseract: `$Tesseract")
+                [void]`$diag.AppendLine("")
+
+                `$partes = @()
+
+                if ([string]::IsNullOrWhiteSpace(`$Tesseract) -or -not (Test-Path `$Tesseract)) {
+                    [void]`$diag.AppendLine("[ERRO] Tesseract OCR nao foi encontrado nesta maquina.")
+                    [void]`$diag.AppendLine("Instale em https://github.com/UB-Mannheim/tesseract/wiki e reinstale a impressora.")
+                } else {
+                    `$imgPath = Join-Path `$env:TEMP "gs_ocr_`$timestamp.png"
+                    `$imgArgs = @(
+                        "-dNOPAUSE", "-dBATCH", "-dSAFER",
+                        "-sDEVICE=png16m",
+                        "-r300",
+                        "-dFirstPage=1",
+                        "-dLastPage=1",
+                        "-sOutputFile=`$imgPath",
+                        "`$pdfPath"
+                    )
+
+                    try {
+                        `$gsImgResult = Start-Process -FilePath `$GS -ArgumentList `$imgArgs -NoNewWindow -Wait -PassThru
+                        [void]`$diag.AppendLine("Renderizacao da pagina 1 em imagem: codigo de saida `$(`$gsImgResult.ExitCode)")
+                    } catch {
+                        [void]`$diag.AppendLine("[ERRO] Falha ao renderizar pagina em imagem: `$_")
+                    }
+
+                    if (Test-Path `$imgPath) {
+                        [void]`$diag.AppendLine("Imagem gerada: SIM (`$((Get-Item `$imgPath).Length) bytes)")
+                        `$ocrBase = Join-Path `$env:TEMP "gs_ocr_`$timestamp"
+                        `$ocrTxtPath = "`${ocrBase}.txt"
+
+                        try {
+                            `$tessResult = Start-Process -FilePath `$Tesseract -ArgumentList @("`$imgPath", "`$ocrBase", "-l", "por") -NoNewWindow -Wait -PassThru
+                            [void]`$diag.AppendLine("Tesseract rodou. Codigo de saida: `$(`$tessResult.ExitCode)")
+                        } catch {
+                            [void]`$diag.AppendLine("[ERRO] Falha ao executar o Tesseract: `$_")
+                        }
+
+                        if (Test-Path `$ocrTxtPath) {
+                            `$textoOriginal = Get-Content `$ocrTxtPath -Raw -ErrorAction SilentlyContinue
+                            [void]`$diag.AppendLine("Texto OCR extraido: SIM (`$(if (`$textoOriginal) { `$textoOriginal.Length } else { 0 }) caracteres)")
+
+                            if (`$textoOriginal) {
+                                `$texto = Remove-Diacritics -Texto `$textoOriginal
+                                `$linhasTexto = `$texto -split "`r`n|`n"
+
+                                foreach (`$rotulo in `$padroes) {
+                                    `$rotuloNorm = Remove-Diacritics -Texto `$rotulo
+                                    `$flex = Get-FlexPattern -Texto `$rotuloNorm
+                                    `$valor = `$null
+                                    `$metodo = "nao encontrado"
+
+                                    if (`$texto -match "(?i)`$flex\s*[:\-]?\s*([^\r\n]+)") {
+                                        `$candidato = Get-SanitizedName -Texto `$Matches[1]
+                                        if (`$candidato) { `$valor = `$candidato; `$metodo = "mesma linha" }
+                                    }
+
+                                    if (-not `$valor) {
+                                        for (`$i = 0; `$i -lt `$linhasTexto.Count; `$i++) {
+                                            if (`$linhasTexto[`$i] -match "(?i)`$flex") {
+                                                for (`$j = `$i + 1; `$j -lt `$linhasTexto.Count; `$j++) {
+                                                    `$candidataLinha = `$linhasTexto[`$j].Trim()
+                                                    if (`$candidataLinha -ne "") {
+                                                        `$valor = Get-SanitizedName -Texto `$candidataLinha
+                                                        `$metodo = "linha seguinte"
+                                                        break
+                                                    }
+                                                }
+                                                break
+                                            }
+                                        }
+                                    }
+
+                                    if (`$valor) {
+                                        `$partes += `$valor
+                                        [void]`$diag.AppendLine("Rotulo '`$rotulo' -> ENCONTRADO ('`$valor', metodo: `$metodo)")
+                                    } else {
+                                        [void]`$diag.AppendLine("Rotulo '`$rotulo' -> NAO encontrado no texto OCR")
+                                    }
+                                }
+
+                                [void]`$diag.AppendLine("")
+                                [void]`$diag.AppendLine("--- TEXTO RECONHECIDO PELO OCR (na integra) ---")
+                                [void]`$diag.AppendLine(`$textoOriginal)
+                            }
+                            Remove-Item `$ocrTxtPath -Force -ErrorAction SilentlyContinue
+                        } else {
+                            [void]`$diag.AppendLine("[AVISO] O Tesseract nao gerou arquivo de texto.")
+                        }
+                        Remove-Item `$imgPath -Force -ErrorAction SilentlyContinue
+                    } else {
+                        [void]`$diag.AppendLine("[ERRO] A imagem da pagina nao foi gerada pelo Ghostscript.")
+                    }
+                }
+
+                Set-Content -Path (Join-Path `$AppFolder "ultimo_texto_extraido.txt") -Value `$diag.ToString() -Encoding UTF8 -ErrorAction SilentlyContinue
+
+                if (`$partes.Count -gt 0) {
+                    `$baseName = (`$partes -join '_')
+                    `$novoNome = "`${baseName}_`$timestamp.pdf"
+                    `$novoPath = Join-Path `$destFolder `$novoNome
+                    `$contador = 2
+                    while (Test-Path `$novoPath) {
+                        `$novoNome = "`${baseName}_`$timestamp (`$contador).pdf"
+                        `$novoPath = Join-Path `$destFolder `$novoNome
+                        `$contador++
+                    }
+                    Move-Item -Path `$pdfPath -Destination `$novoPath -Force
+                    `$pdfPath = `$novoPath
+                }
+            }
+
             Write-Host "[OK] PDF salvo: `$pdfPath" -ForegroundColor Green
         } else {
             Write-Host "[ERRO] PDF nao foi gerado corretamente" -ForegroundColor Red
@@ -256,7 +460,7 @@ function Set-DestinationFolder {
 
     $novaPasta = $picker.SelectedPath
     try {
-        Set-Content -Path $CONFIG_FILE -Value "SaveFolder=$novaPasta" -Encoding ASCII -ErrorAction Stop
+        Set-ConfigValue -Key "SaveFolder" -Value $novaPasta
         Write-Host "[OK] config.ini atualizado com sucesso" -ForegroundColor Green
     } catch {
         Write-Host "[ERRO] Nao foi possivel gravar o config.ini: $_" -ForegroundColor Red
@@ -272,6 +476,66 @@ function Set-DestinationFolder {
     Write-Host "     O monitor ja usara essa pasta automaticamente no proximo trabalho de impressao."
     Write-Host ""
     Read-Host "Pressione Enter para fechar"
+}
+
+function Set-NamePattern {
+    if (-not (Test-Path $APP_FOLDER)) {
+        [System.Windows.Forms.MessageBox]::Show("A Impressora PDF Virtual ainda nao foi instalada.", "Erro", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        return
+    }
+
+    $atual = Get-ConfigValue -Key "NamePatterns"
+    $listaAtual = @()
+    if ($atual) { $listaAtual = @($atual -split '\|\|\|') }
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Configurar Nome Automatico dos PDFs"
+    $dlg.Size = New-Object System.Drawing.Size(460, 360)
+    $dlg.StartPosition = "CenterScreen"
+    $dlg.FormBorderStyle = "FixedDialog"
+    $dlg.MaximizeBox = $false
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = "Digite um rotulo por linha, exatamente como aparece no PDF (ex: transacionador:," + [Environment]::NewLine + "natureza da operacao). O monitor procura cada um e junta o que encontrar" + [Environment]::NewLine + "no nome do arquivo. Deixe tudo em branco para usar somente data/hora."
+    $lbl.Size = New-Object System.Drawing.Size(410, 60)
+    $lbl.Location = New-Object System.Drawing.Point(15, 15)
+    $dlg.Controls.Add($lbl)
+
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Multiline = $true
+    $txt.ScrollBars = "Vertical"
+    $txt.Size = New-Object System.Drawing.Size(410, 170)
+    $txt.Location = New-Object System.Drawing.Point(15, 80)
+    $txt.Text = ($listaAtual -join [Environment]::NewLine)
+    $dlg.Controls.Add($txt)
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = "Salvar"
+    $btnOk.Size = New-Object System.Drawing.Size(120, 35)
+    $btnOk.Location = New-Object System.Drawing.Point(15, 265)
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dlg.Controls.Add($btnOk)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancelar"
+    $btnCancel.Size = New-Object System.Drawing.Size(120, 35)
+    $btnCancel.Location = New-Object System.Drawing.Point(145, 265)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($btnCancel)
+
+    $dlg.AcceptButton = $btnOk
+    $dlg.CancelButton = $btnCancel
+
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $novaLista = @($txt.Text -split "`r`n|`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+        Set-ConfigValue -Key "NamePatterns" -Value ($novaLista -join '|||')
+
+        if ($novaLista.Count -gt 0) {
+            [System.Windows.Forms.MessageBox]::Show(("Rotulos salvos:" + [Environment]::NewLine + ($novaLista -join [Environment]::NewLine)), "Configuracao salva", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Nomeacao automatica desativada. PDFs voltarao a usar somente data/hora.", "Configuracao salva", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        }
+    }
 }
 
 function Uninstall-Printer {
@@ -345,11 +609,12 @@ function Uninstall-Printer {
 if ($Action -eq 'Install') { Install-Printer; exit }
 if ($Action -eq 'AlterarPasta') { Set-DestinationFolder; exit }
 if ($Action -eq 'Uninstall') { Uninstall-Printer; exit }
+if ($Action -eq 'NamePattern') { Set-NamePattern; exit }
 
 # --- Interface grafica principal ---
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Impressora PDF Virtual"
-$form.Size = New-Object System.Drawing.Size(420, 310)
+$form.Size = New-Object System.Drawing.Size(420, 365)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
@@ -389,10 +654,21 @@ $btnAlterar.Add_Click({
 })
 $form.Controls.Add($btnAlterar)
 
+$btnNomePattern = New-Object System.Windows.Forms.Button
+$btnNomePattern.Text = "Configurar Nome Automatico dos PDFs"
+$btnNomePattern.Size = New-Object System.Drawing.Size(360, 45)
+$btnNomePattern.Location = New-Object System.Drawing.Point(20, 200)
+$btnNomePattern.Add_Click({
+    $form.Hide()
+    Set-NamePattern
+    $form.Show()
+})
+$form.Controls.Add($btnNomePattern)
+
 $btnDesinstalar = New-Object System.Windows.Forms.Button
 $btnDesinstalar.Text = "Desinstalar"
 $btnDesinstalar.Size = New-Object System.Drawing.Size(360, 45)
-$btnDesinstalar.Location = New-Object System.Drawing.Point(20, 200)
+$btnDesinstalar.Location = New-Object System.Drawing.Point(20, 255)
 $btnDesinstalar.Add_Click({
     $form.Hide()
     Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Uninstall" -Wait
@@ -403,7 +679,7 @@ $form.Controls.Add($btnDesinstalar)
 $btnSair = New-Object System.Windows.Forms.Button
 $btnSair.Text = "Sair"
 $btnSair.Size = New-Object System.Drawing.Size(360, 30)
-$btnSair.Location = New-Object System.Drawing.Point(20, 250)
+$btnSair.Location = New-Object System.Drawing.Point(20, 305)
 $btnSair.Add_Click({ $form.Close() })
 $form.Controls.Add($btnSair)
 
