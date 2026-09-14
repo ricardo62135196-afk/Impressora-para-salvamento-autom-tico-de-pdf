@@ -14,9 +14,11 @@ Add-Type -AssemblyName System.Drawing
 $APP_FOLDER     = "$env:ProgramData\PDFVirtualPrinter"
 $SPOOL_FOLDER   = "$APP_FOLDER\spool"
 $PORT_FILE      = "$SPOOL_FOLDER\job.ps"
-$CONFIG_FILE    = "$APP_FOLDER\config.ini"
+$CONFIG_FILE    = "$APP_FOLDER\config.json"
+$LEGACY_CONFIG_FILE = "$APP_FOLDER\config.ini"
 $MONITOR_SCRIPT = "$APP_FOLDER\monitor_pdf.ps1"
 $PRINTER_NAME   = "Impressora PDF Virtual"
+$SAFE_DEFAULT_FOLDER = "$APP_FOLDER\PDFs"
 
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -41,16 +43,33 @@ function Find-Ghostscript {
 function Find-Tesseract {
     $t = Get-Command tesseract -ErrorAction SilentlyContinue
     if ($t) { return $t.Source }
+
     $candidatos = @(
         "C:\Program Files\Tesseract-OCR\tesseract.exe",
-        "C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"
+        "C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        "$env:LOCALAPPDATA\Programs\Tesseract-OCR\tesseract.exe",
+        "$env:LOCALAPPDATA\Tesseract-OCR\tesseract.exe"
     )
     foreach ($c in $candidatos) {
         if (Test-Path $c) { return $c }
     }
+
+    # Instalacao feita sem admin cai na pasta do usuario. Como a instalacao da impressora
+    # roda elevada (as vezes com conta diferente de quem instalou o Tesseract), procura em
+    # TODOS os perfis da maquina, nao so no do processo atual.
+    $padroesCoringa = @(
+        "C:\Users\*\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
+        "C:\Users\*\AppData\Local\Tesseract-OCR\tesseract.exe"
+    )
+    foreach ($padrao in $padroesCoringa) {
+        $achado = Get-ChildItem -Path $padrao -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($achado) { return $achado.FullName }
+    }
+
     return $null
 }
 
+$SHARED_MATCHING_FUNCTIONS = @'
 function Remove-Diacritics {
     param($Texto)
     $normalizado = $Texto.Normalize([Text.NormalizationForm]::FormD)
@@ -79,23 +98,72 @@ function Get-SanitizedName {
     if ($limpo -eq "") { return $null }
     return $limpo
 }
+'@
+Invoke-Expression $SHARED_MATCHING_FUNCTIONS
 
-function Get-ConfigValue {
-    param($Key)
-    if (-not (Test-Path $CONFIG_FILE)) { return $null }
-    $linha = Get-Content $CONFIG_FILE -Encoding UTF8 | Where-Object { $_ -like "$Key=*" }
-    if ($linha) { return ($linha -replace "^$Key=", "") }
-    return $null
+function Invoke-Tool {
+    param($Exe, [string[]]$ArgList)
+    $quoted = $ArgList | ForEach-Object { "`"$_`"" }
+    return Start-Process -FilePath $Exe -ArgumentList $quoted -NoNewWindow -Wait -PassThru
 }
 
-function Set-ConfigValue {
-    param($Key, $Value)
-    $linhas = @()
-    if (Test-Path $CONFIG_FILE) {
-        $linhas = @(Get-Content $CONFIG_FILE -Encoding UTF8 | Where-Object { $_ -notlike "$Key=*" -and $_.Trim() -ne "" })
+function Get-DefaultConfig {
+    return [PSCustomObject]@{
+        SaveFolder    = $SAFE_DEFAULT_FOLDER
+        NamePatterns  = @()
+        SearchablePdf = $false
+        FolderRules   = @()
     }
-    $linhas += "$Key=$Value"
-    Set-Content -Path $CONFIG_FILE -Value $linhas -Encoding UTF8
+}
+
+function Import-LegacyIniConfig {
+    param($Path)
+    $cfg = Get-DefaultConfig
+    $linhas = Get-Content $Path -Encoding UTF8 -ErrorAction SilentlyContinue
+    foreach ($linha in $linhas) {
+        if ($linha -match '^SaveFolder=(.*)$') {
+            $cfg.SaveFolder = $Matches[1]
+        } elseif ($linha -match '^NamePatterns=(.*)$') {
+            $cfg.NamePatterns = @($Matches[1] -split '\|\|\|' | Where-Object { $_ -ne '' })
+        } elseif ($linha -match '^SearchablePdf=(.*)$') {
+            $cfg.SearchablePdf = ($Matches[1] -eq '1')
+        } elseif ($linha -match '^FolderRules=(.*)$') {
+            $regras = @()
+            foreach ($par in ($Matches[1] -split '\|\|\|')) {
+                if ($par -eq '') { continue }
+                $pp = $par -split '::', 2
+                if ($pp.Count -eq 2) { $regras += [PSCustomObject]@{ Valor = $pp[0]; Pasta = $pp[1] } }
+            }
+            $cfg.FolderRules = $regras
+        }
+    }
+    return $cfg
+}
+
+function Import-AppConfig {
+    if (Test-Path $CONFIG_FILE) {
+        try {
+            $json = Get-Content $CONFIG_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+            $cfg = Get-DefaultConfig
+            foreach ($prop in $json.PSObject.Properties) { $cfg.$($prop.Name) = $prop.Value }
+            if (-not $cfg.NamePatterns) { $cfg.NamePatterns = @() }
+            if (-not $cfg.FolderRules) { $cfg.FolderRules = @() }
+            return $cfg
+        } catch {
+            return Get-DefaultConfig
+        }
+    }
+    if (Test-Path $LEGACY_CONFIG_FILE) {
+        $migrado = Import-LegacyIniConfig -Path $LEGACY_CONFIG_FILE
+        Save-AppConfig -Config $migrado
+        return $migrado
+    }
+    return Get-DefaultConfig
+}
+
+function Save-AppConfig {
+    param($Config)
+    $Config | ConvertTo-Json -Depth 6 | Set-Content -Path $CONFIG_FILE -Encoding UTF8
 }
 
 function Show-PreviewResult {
@@ -103,7 +171,6 @@ function Show-PreviewResult {
 
     $resultDlg = New-Object System.Windows.Forms.Form
     $resultDlg.Text = "Previa do Texto Extraido (OCR)"
-    $resultDlg.Size = New-Object System.Drawing.Size(560, 500)
     $resultDlg.StartPosition = "CenterScreen"
 
     $linhasResumo = @()
@@ -163,6 +230,8 @@ function Show-PreviewResult {
     $btnFechar.Add_Click({ $resultDlg.Close() })
     $resultDlg.Controls.Add($btnFechar)
 
+    $resultDlg.ClientSize = New-Object System.Drawing.Size(550, ($btnFechar.Location.Y + $btnFechar.Size.Height + 15))
+
     [void]$resultDlg.ShowDialog()
 }
 
@@ -192,15 +261,15 @@ function Test-ExtracaoTexto {
     $tempTxt = "${tempBase}.txt"
     Remove-Item $tempImg, $tempTxt -Force -ErrorAction SilentlyContinue
 
-    $imgArgs = @("-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=png16m", "-r300", "-dFirstPage=1", "-dLastPage=1", "-sOutputFile=`"$tempImg`"", "`"$pdfTeste`"")
-    Start-Process -FilePath $gsPath -ArgumentList $imgArgs -NoNewWindow -Wait
+    $imgArgs = @("-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=png16m", "-r300", "-dFirstPage=1", "-dLastPage=1", "-sOutputFile=$tempImg", "$pdfTeste")
+    Invoke-Tool -Exe $gsPath -ArgList $imgArgs | Out-Null
 
     if (-not (Test-Path $tempImg)) {
         [System.Windows.Forms.MessageBox]::Show("Nao foi possivel renderizar a pagina do PDF selecionado.", "Erro", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
         return
     }
 
-    Start-Process -FilePath $tessPath -ArgumentList @("`"$tempImg`"", "`"$tempBase`"", "-l", "por") -NoNewWindow -Wait
+    Invoke-Tool -Exe $tessPath -ArgList @($tempImg, $tempBase, "-l", "por") | Out-Null
 
     if (-not (Test-Path $tempTxt)) {
         [System.Windows.Forms.MessageBox]::Show("O Tesseract nao gerou texto para esse PDF.", "Erro", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
@@ -215,23 +284,14 @@ function Test-ExtracaoTexto {
 }
 
 function Get-FolderRules {
-    $bruto = Get-ConfigValue -Key "FolderRules"
-    if (-not $bruto) { return @() }
-    $regras = @()
-    foreach ($par in ($bruto -split '\|\|\|')) {
-        if ($par -eq "") { continue }
-        $partesPar = $par -split '::', 2
-        if ($partesPar.Count -eq 2) {
-            $regras += [PSCustomObject]@{ Valor = $partesPar[0]; Pasta = $partesPar[1] }
-        }
-    }
-    return $regras
+    return @((Import-AppConfig).FolderRules)
 }
 
 function Set-FolderRulesConfig {
     param($Regras)
-    $codificado = (@($Regras | ForEach-Object { "$($_.Valor)::$($_.Pasta)" })) -join '|||'
-    Set-ConfigValue -Key "FolderRules" -Value $codificado
+    $cfg = Import-AppConfig
+    $cfg.FolderRules = @($Regras | ForEach-Object { [PSCustomObject]@{ Valor = $_.Valor; Pasta = $_.Pasta } })
+    Save-AppConfig -Config $cfg
 }
 
 function Set-FolderRoutingRules {
@@ -245,7 +305,7 @@ function Set-FolderRoutingRules {
 
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = "Configurar Pastas por Valor Extraido"
-    $dlg.Size = New-Object System.Drawing.Size(500, 430)
+    $dlg.ClientSize = New-Object System.Drawing.Size(500, 400)
     $dlg.StartPosition = "CenterScreen"
     $dlg.FormBorderStyle = "FixedDialog"
     $dlg.MaximizeBox = $false
@@ -352,6 +412,10 @@ function Install-Printer {
     New-Item -ItemType Directory -Path $SPOOL_FOLDER -Force | Out-Null
     Write-Host "      Liberando permissao de escrita para qualquer usuario..."
     icacls $APP_FOLDER /grant "*S-1-5-32-545:(OI)(CI)M" /T | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "      [AVISO] icacls retornou codigo $LASTEXITCODE - a permissao pode nao ter sido aplicada corretamente." -ForegroundColor Yellow
+        Write-Host "               Se 'Alterar Pasta' ou 'Configurar Nome Automatico' falharem depois, rode o instalador novamente." -ForegroundColor Yellow
+    }
     Write-Host "      [OK] Pastas criadas em: $APP_FOLDER" -ForegroundColor Green
     Write-Host ""
 
@@ -383,12 +447,14 @@ function Install-Printer {
     $DEST_FOLDER = $null
     if ($picker.ShowDialog() -eq 'OK') { $DEST_FOLDER = $picker.SelectedPath }
     if (-not $DEST_FOLDER) {
-        $DEST_FOLDER = "$env:USERPROFILE\Documents\PDFs"
+        $DEST_FOLDER = $SAFE_DEFAULT_FOLDER
         New-Item -ItemType Directory -Path $DEST_FOLDER -Force | Out-Null
         Write-Host "      [AVISO] Nenhuma pasta selecionada. Usando pasta padrao." -ForegroundColor Yellow
     }
     Write-Host "      [OK] PDFs serao salvos em: $DEST_FOLDER" -ForegroundColor Green
-    Set-ConfigValue -Key "SaveFolder" -Value $DEST_FOLDER
+    $cfgInstalacao = Import-AppConfig
+    $cfgInstalacao.SaveFolder = $DEST_FOLDER
+    Save-AppConfig -Config $cfgInstalacao
     Write-Host ""
 
     Write-Host "[4/9] Limpando instalacao anterior, se houver..."
@@ -408,8 +474,12 @@ function Install-Printer {
 
     Write-Host "[6/9] Instalando impressora..."
     rundll32 printui.dll,PrintUIEntry /if /b "$PRINTER_NAME" /f "$env:windir\inf\ntprint.inf" /r "$PORT_FILE" /m "MS Publisher Imagesetter"
-    Start-Sleep -Seconds 1
-    if (-not (Get-Printer -Name $PRINTER_NAME -ErrorAction SilentlyContinue)) {
+    $encontrada = $false
+    for ($tentativa = 0; $tentativa -lt 5; $tentativa++) {
+        Start-Sleep -Milliseconds 500
+        if (Get-Printer -Name $PRINTER_NAME -ErrorAction SilentlyContinue) { $encontrada = $true; break }
+    }
+    if (-not $encontrada) {
         Write-Host "      [AVISO] Tentando driver alternativo..." -ForegroundColor Yellow
         rundll32 printui.dll,PrintUIEntry /if /b "$PRINTER_NAME" /f "$env:windir\inf\ntprint.inf" /r "$PORT_FILE" /m "MS Publisher Color Printer"
     }
@@ -423,115 +493,122 @@ function Install-Printer {
     Write-Host ""
 
     Write-Host "[8/9] Criando monitor de conversao..."
+    $commonContent = @"
+function Remove-Diacritics {
+$((Get-Command Remove-Diacritics).Definition)
+}
+
+function Get-FlexPattern {
+$((Get-Command Get-FlexPattern).Definition)
+}
+
+function Get-SanitizedName {
+$((Get-Command Get-SanitizedName).Definition)
+}
+
+function Invoke-Tool {
+$((Get-Command Invoke-Tool).Definition)
+}
+"@
+    Set-Content -Path "$APP_FOLDER\Common.ps1" -Value $commonContent -Encoding UTF8
+    Write-Host "      [OK] Funcoes compartilhadas geradas em Common.ps1" -ForegroundColor Green
     $monitorContent = @"
 # Monitor da Impressora Virtual PDF
 `$ErrorActionPreference = "SilentlyContinue"
 
-`$PortFile   = "$PORT_FILE"
-`$ConfigFile = "$CONFIG_FILE"
-`$GS         = "$GS_PATH"
-`$AppFolder  = "$APP_FOLDER"
-`$Tesseract  = "$TESS_PATH"
+`$PortFile    = "$PORT_FILE"
+`$SpoolFolder = "$SPOOL_FOLDER"
+`$ConfigFile  = "$CONFIG_FILE"
+`$GS          = "$GS_PATH"
+`$AppFolder   = "$APP_FOLDER"
+`$Tesseract   = "$TESS_PATH"
 
 Write-Host "=== MONITOR IMPRESSORA PDF VIRTUAL ===" -ForegroundColor Green
 Write-Host "Arquivo de porta: `$PortFile" -ForegroundColor Yellow
 Write-Host "Config: `$ConfigFile" -ForegroundColor Yellow
 
-function Get-DestFolder {
-    `$linha = Get-Content `$ConfigFile -Encoding UTF8 | Where-Object { `$_ -like "SaveFolder=*" }
-    if (-not `$linha) { return "`$env:USERPROFILE\Documents\PDFs" }
-    `$folder = `$linha -replace "^SaveFolder=", ""
-    if (-not (Test-Path `$folder)) { New-Item -ItemType Directory -Path `$folder -Force | Out-Null }
-    return `$folder
+function Write-Log {
+    param(`$Mensagem)
+    try {
+        `$linha = "[`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] `$Mensagem"
+        `$logPath = Join-Path `$AppFolder "monitor.log"
+        Add-Content -Path `$logPath -Value `$linha -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ((Test-Path `$logPath) -and ((Get-Item `$logPath).Length -gt 500KB)) {
+            `$linhasLog = Get-Content `$logPath -Encoding UTF8 -Tail 200
+            Set-Content -Path `$logPath -Value `$linhasLog -Encoding UTF8
+        }
+    } catch { }
+}
+
+function Get-Config {
+    `$default = [PSCustomObject]@{
+        SaveFolder    = "$SAFE_DEFAULT_FOLDER"
+        NamePatterns  = @()
+        SearchablePdf = `$false
+        FolderRules   = @()
+    }
+    if (-not (Test-Path `$ConfigFile)) { return `$default }
+    try {
+        `$json = Get-Content `$ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not `$json.SaveFolder) { `$json | Add-Member -NotePropertyName SaveFolder -NotePropertyValue `$default.SaveFolder -Force }
+        if (-not `$json.NamePatterns) { `$json | Add-Member -NotePropertyName NamePatterns -NotePropertyValue @() -Force }
+        if (`$null -eq `$json.SearchablePdf) { `$json | Add-Member -NotePropertyName SearchablePdf -NotePropertyValue `$false -Force }
+        if (-not `$json.FolderRules) { `$json | Add-Member -NotePropertyName FolderRules -NotePropertyValue @() -Force }
+        if (-not (Test-Path `$json.SaveFolder)) { New-Item -ItemType Directory -Path `$json.SaveFolder -Force | Out-Null }
+        return `$json
+    } catch {
+        Write-Log "[ERRO] Falha ao ler config.json: `$_"
+        return `$default
+    }
 }
 
 function Wait-FileReady {
-    param(`$Path)
-    `$pronto = `$false
-    while (-not `$pronto) {
-        Start-Sleep -Milliseconds 800
+    param(`$Path, `$TimeoutSeconds = 60)
+    `$inicio = Get-Date
+    while (`$true) {
         try {
             `$s = [System.IO.File]::Open(`$Path, 'Open', 'ReadWrite', 'None')
             `$s.Close()
-            `$pronto = `$true
+            return `$true
         } catch {
-            `$pronto = `$false
+            if (((Get-Date) - `$inicio).TotalSeconds -gt `$TimeoutSeconds) { return `$false }
+            Start-Sleep -Milliseconds 100
         }
     }
 }
 
-function Get-NamePatterns {
-    if (-not (Test-Path `$ConfigFile)) { return @() }
-    `$linha = Get-Content `$ConfigFile -Encoding UTF8 | Where-Object { `$_ -like "NamePatterns=*" }
-    if (-not `$linha) { return @() }
-    `$valor = (`$linha -replace "^NamePatterns=", "").Trim()
-    if (`$valor -eq "") { return @() }
-    return @(`$valor -split '\|\|\|' | ForEach-Object { `$_.Trim() } | Where-Object { `$_ -ne "" })
-}
+. (Join-Path `$AppFolder "Common.ps1")
 
-function Get-SearchablePdfEnabled {
-    if (-not (Test-Path `$ConfigFile)) { return `$false }
-    `$linha = Get-Content `$ConfigFile -Encoding UTF8 | Where-Object { `$_ -like "SearchablePdf=*" }
-    if (-not `$linha) { return `$false }
-    `$valor = (`$linha -replace "^SearchablePdf=", "").Trim()
-    return (`$valor -eq "1")
-}
-
-function Get-FolderRules {
-    if (-not (Test-Path `$ConfigFile)) { return @() }
-    `$linha = Get-Content `$ConfigFile -Encoding UTF8 | Where-Object { `$_ -like "FolderRules=*" }
-    if (-not `$linha) { return @() }
-    `$bruto = (`$linha -replace "^FolderRules=", "").Trim()
-    if (`$bruto -eq "") { return @() }
-    `$regras = @()
-    foreach (`$par in (`$bruto -split '\|\|\|')) {
-        if (`$par -eq "") { continue }
-        `$partesPar = `$par -split '::', 2
-        if (`$partesPar.Count -eq 2) {
-            `$regras += [PSCustomObject]@{ Valor = `$partesPar[0]; Pasta = `$partesPar[1] }
-        }
-    }
-    return `$regras
-}
-
-function Remove-Diacritics {
-    param(`$Texto)
-    `$normalizado = `$Texto.Normalize([Text.NormalizationForm]::FormD)
-    `$sb = New-Object System.Text.StringBuilder
-    foreach (`$ch in `$normalizado.ToCharArray()) {
-        if ([Globalization.CharUnicodeInfo]::GetUnicodeCategory(`$ch) -ne [Globalization.UnicodeCategory]::NonSpacingMark) {
-            [void]`$sb.Append(`$ch)
-        }
-    }
-    return `$sb.ToString().Normalize([Text.NormalizationForm]::FormC)
-}
-
-function Get-FlexPattern {
-    param(`$Texto)
-    `$chars = `$Texto.ToCharArray() | ForEach-Object { [RegEx]::Escape([string]`$_) }
-    return (`$chars -join '\s*')
-}
-
-function Get-SanitizedName {
-    param(`$Texto)
-    `$invalidos = [IO.Path]::GetInvalidFileNameChars() -join ''
-    `$regexInvalidos = "[{0}]" -f [RegEx]::Escape(`$invalidos)
-    `$limpo = (`$Texto -replace `$regexInvalidos, '_').Trim()
-    `$limpo = `$limpo -replace '\s+', ' '
-    if (`$limpo.Length -gt 60) { `$limpo = `$limpo.Substring(0, 60).Trim() }
-    if (`$limpo -eq "") { return `$null }
-    return `$limpo
-}
-
+Write-Log "Monitor iniciado."
+Get-ChildItem -Path `$env:TEMP -Filter "gs_ocr_*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path `$SpoolFolder -Filter "job_*.ps" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 Write-Host "Monitor ativo. Aguardando impressoes..." -ForegroundColor Green
 
-while (`$true) {
+:MonitorLoop while (`$true) {
     if (Test-Path `$PortFile) {
-        Wait-FileReady -Path `$PortFile
-        Start-Sleep -Milliseconds 500
+        `$liberado = Wait-FileReady -Path `$PortFile -TimeoutSeconds 60
+        if (-not `$liberado) {
+            Write-Log "[ERRO] Tempo esgotado aguardando o arquivo de impressao ser liberado. Descartando esta impressao."
+            Remove-Item `$PortFile -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+            continue MonitorLoop
+        }
 
-        `$destFolder = Get-DestFolder
-        `$timestamp  = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+        # Captura o arquivo imediatamente com um nome unico, liberando o job.ps na hora
+        # para a proxima impressao. Sem isso, imprimir rapido em sequencia pode misturar
+        # ou perder trabalhos, ja que todos compartilham o mesmo arquivo fixo de porta.
+        `$timestamp   = Get-Date -Format "yyyy-MM-dd_HH-mm-ss-fff"
+        `$jobFilePath = Join-Path `$SpoolFolder "job_`$timestamp.ps"
+        try {
+            Move-Item -Path `$PortFile -Destination `$jobFilePath -Force -ErrorAction Stop
+        } catch {
+            Write-Log "[ERRO] Nao foi possivel capturar o arquivo de impressao (pode ter sido sobrescrito por outra impressao simultanea): `$_"
+            Start-Sleep -Seconds 1
+            continue MonitorLoop
+        }
+
+        `$config     = Get-Config
+        `$destFolder = `$config.SaveFolder
         `$pdfPath    = Join-Path `$destFolder "Documento_`$timestamp.pdf"
 
         `$gsArgs = @(
@@ -542,19 +619,20 @@ while (`$true) {
             "-dEmbedAllFonts=true",
             "-dSubsetFonts=true",
             "-dAutoRotatePages=/None",
-            "-sOutputFile=``"`$pdfPath``"",
-            "``"`$PortFile``""
+            "-sOutputFile=`$pdfPath",
+            "`$jobFilePath"
         )
 
         try {
-            Start-Process -FilePath `$GS -ArgumentList `$gsArgs -NoNewWindow -Wait
+            Invoke-Tool -Exe `$GS -ArgList `$gsArgs | Out-Null
         } catch {
+            Write-Log "[ERRO] Falha ao converter PDF: `$_"
             Write-Host "[ERRO] Falha ao converter: `$_" -ForegroundColor Red
         }
 
         if ((Test-Path `$pdfPath) -and ((Get-Item `$pdfPath).Length -gt 1024)) {
-            `$padroes = Get-NamePatterns
-            `$pesquisavel = Get-SearchablePdfEnabled
+            `$padroes = @(`$config.NamePatterns)
+            `$pesquisavel = [bool]`$config.SearchablePdf
             `$tessDisponivel = (-not [string]::IsNullOrWhiteSpace(`$Tesseract)) -and (Test-Path `$Tesseract)
 
             if ((`$padroes.Count -gt 0 -or `$pesquisavel) -and `$tessDisponivel) {
@@ -575,12 +653,13 @@ while (`$true) {
                         "-dNOPAUSE", "-dBATCH", "-dSAFER",
                         "-sDEVICE=tiffgray",
                         "-r300",
-                        "-sOutputFile=``"`$tiffPath``"",
-                        "``"`$pdfPath``""
+                        "-dLastPage=30",
+                        "-sOutputFile=`$tiffPath",
+                        "`$pdfPath"
                     )
                     try {
-                        `$gsTiffResult = Start-Process -FilePath `$GS -ArgumentList `$tiffArgs -NoNewWindow -Wait -PassThru
-                        [void]`$diag.AppendLine("Renderizacao de todas as paginas (TIFF): codigo de saida `$(`$gsTiffResult.ExitCode)")
+                        `$gsTiffResult = Invoke-Tool -Exe `$GS -ArgList `$tiffArgs
+                        [void]`$diag.AppendLine("Renderizacao de todas as paginas (TIFF, limite de 30 paginas): codigo de saida `$(`$gsTiffResult.ExitCode)")
                     } catch {
                         [void]`$diag.AppendLine("[ERRO] Falha ao renderizar paginas: `$_")
                     }
@@ -591,7 +670,7 @@ while (`$true) {
                         `$ocrPdfPath = "`${ocrBase}.pdf"
 
                         try {
-                            `$tessResult = Start-Process -FilePath `$Tesseract -ArgumentList @("``"`$tiffPath``"", "``"`$ocrBase``"", "-l", "por", "txt", "pdf") -NoNewWindow -Wait -PassThru
+                            `$tessResult = Invoke-Tool -Exe `$Tesseract -ArgList @(`$tiffPath, `$ocrBase, "-l", "por", "txt", "pdf")
                             [void]`$diag.AppendLine("Tesseract (txt+pdf) rodou. Codigo de saida: `$(`$tessResult.ExitCode)")
                         } catch {
                             [void]`$diag.AppendLine("[ERRO] Falha ao executar o Tesseract: `$_")
@@ -621,11 +700,11 @@ while (`$true) {
                         "-r300",
                         "-dFirstPage=1",
                         "-dLastPage=1",
-                        "-sOutputFile=``"`$imgPath``"",
-                        "``"`$pdfPath``""
+                        "-sOutputFile=`$imgPath",
+                        "`$pdfPath"
                     )
                     try {
-                        `$gsImgResult = Start-Process -FilePath `$GS -ArgumentList `$imgArgs -NoNewWindow -Wait -PassThru
+                        `$gsImgResult = Invoke-Tool -Exe `$GS -ArgList `$imgArgs
                         [void]`$diag.AppendLine("Renderizacao da pagina 1 em imagem: codigo de saida `$(`$gsImgResult.ExitCode)")
                     } catch {
                         [void]`$diag.AppendLine("[ERRO] Falha ao renderizar pagina em imagem: `$_")
@@ -637,7 +716,7 @@ while (`$true) {
                         `$ocrTxtPath = "`${ocrBase}.txt"
 
                         try {
-                            `$tessResult = Start-Process -FilePath `$Tesseract -ArgumentList @("``"`$imgPath``"", "``"`$ocrBase``"", "-l", "por") -NoNewWindow -Wait -PassThru
+                            `$tessResult = Invoke-Tool -Exe `$Tesseract -ArgList @(`$imgPath, `$ocrBase, "-l", "por")
                             [void]`$diag.AppendLine("Tesseract rodou. Codigo de saida: `$(`$tessResult.ExitCode)")
                         } catch {
                             [void]`$diag.AppendLine("[ERRO] Falha ao executar o Tesseract: `$_")
@@ -702,18 +781,28 @@ while (`$true) {
 
                 if (`$partes.Count -gt 0) {
                     `$pastaFinal = `$destFolder
-                    `$regrasPasta = Get-FolderRules
+                    `$regrasPasta = @(`$config.FolderRules)
                     if (`$regrasPasta.Count -gt 0) {
                         `$primeiraParte = `$partes[0]
+                        `$regraEncontrada = `$null
                         foreach (`$regra in `$regrasPasta) {
-                            if (`$regra.Valor -eq `$primeiraParte) {
-                                if (Test-Path `$regra.Pasta) {
-                                    `$pastaFinal = `$regra.Pasta
-                                    [void]`$diag.AppendLine("Regra de pasta aplicada: '`$primeiraParte' -> `$pastaFinal")
-                                } else {
-                                    [void]`$diag.AppendLine("[AVISO] Regra de pasta para '`$primeiraParte' aponta para pasta inexistente, usando pasta padrao.")
+                            if (`$regra.Valor -eq `$primeiraParte) { `$regraEncontrada = `$regra; break }
+                        }
+                        if (-not `$regraEncontrada) {
+                            foreach (`$regra in `$regrasPasta) {
+                                if (`$primeiraParte.ToLowerInvariant().Contains(`$regra.Valor.ToLowerInvariant()) -or `$regra.Valor.ToLowerInvariant().Contains(`$primeiraParte.ToLowerInvariant())) {
+                                    `$regraEncontrada = `$regra
+                                    [void]`$diag.AppendLine("[INFO] Nenhuma regra bateu exatamente, usando correspondencia parcial.")
+                                    break
                                 }
-                                break
+                            }
+                        }
+                        if (`$regraEncontrada) {
+                            if (Test-Path `$regraEncontrada.Pasta) {
+                                `$pastaFinal = `$regraEncontrada.Pasta
+                                [void]`$diag.AppendLine("Regra de pasta aplicada: '`$primeiraParte' -> `$pastaFinal")
+                            } else {
+                                [void]`$diag.AppendLine("[AVISO] Regra de pasta para '`$primeiraParte' aponta para pasta inexistente, usando pasta padrao.")
                             }
                         }
                     }
@@ -737,15 +826,17 @@ while (`$true) {
                 Set-Content -Path (Join-Path `$AppFolder "ultimo_texto_extraido.txt") -Value `$diagSimples -Encoding UTF8 -ErrorAction SilentlyContinue
             }
 
+            Write-Log "PDF salvo com sucesso: `$pdfPath"
             Write-Host "[OK] PDF salvo: `$pdfPath" -ForegroundColor Green
         } else {
+            Write-Log "[ERRO] PDF nao foi gerado corretamente (arquivo ausente ou muito pequeno): `$pdfPath"
             Write-Host "[ERRO] PDF nao foi gerado corretamente" -ForegroundColor Red
             Remove-Item `$pdfPath -Force -ErrorAction SilentlyContinue
         }
 
-        Remove-Item `$PortFile -Force -ErrorAction SilentlyContinue
+        Remove-Item `$jobFilePath -Force -ErrorAction SilentlyContinue
     }
-    Start-Sleep -Seconds 1
+    Start-Sleep -Milliseconds 200
 }
 "@
     Set-Content -Path $MONITOR_SCRIPT -Value $monitorContent -Encoding UTF8
@@ -753,19 +844,35 @@ while (`$true) {
     Write-Host ""
 
     Write-Host "[9/9] Configurando inicializacao automatica do monitor..."
+    try {
+        Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction Stop
+    } catch {
+        # Pode "falhar" so porque uma Politica de Grupo (comum em maquinas de escola/empresa)
+        # controla isso em um nivel mais especifico - o que importa e o resultado efetivo abaixo.
+    }
+    $politicaEfetiva = Get-ExecutionPolicy
+    $politicasQuePermitemSemBypass = @('Bypass', 'Unrestricted', 'RemoteSigned')
+    if ($politicaEfetiva -in $politicasQuePermitemSemBypass) {
+        Write-Host "      [OK] Politica de execucao efetiva: $politicaEfetiva (monitor roda sem -Bypass)" -ForegroundColor Green
+        $argsMonitor = "-WindowStyle Hidden -File `"$MONITOR_SCRIPT`""
+    } else {
+        Write-Host "      [AVISO] Politica de execucao efetiva: $politicaEfetiva - mantendo -Bypass no atalho como seguranca." -ForegroundColor Yellow
+        $argsMonitor = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$MONITOR_SCRIPT`""
+    }
+
     $wsh = New-Object -ComObject WScript.Shell
     $startupFolder = $wsh.SpecialFolders('AllUsersStartup')
     if (-not (Test-Path $startupFolder)) { New-Item -ItemType Directory -Path $startupFolder -Force | Out-Null }
     $shortcutPath = Join-Path $startupFolder 'Monitor PDF Virtual.lnk'
     $s = $wsh.CreateShortcut($shortcutPath)
     $s.TargetPath = "powershell.exe"
-    $s.Arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$MONITOR_SCRIPT`""
+    $s.Arguments = $argsMonitor
     $s.WorkingDirectory = $APP_FOLDER
     $s.Save()
     Write-Host "      [OK] Atalho criado para todos os usuarios" -ForegroundColor Green
     Write-Host ""
 
-    Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$MONITOR_SCRIPT`"" -WorkingDirectory $APP_FOLDER
+    Start-Process powershell.exe -ArgumentList $argsMonitor -WorkingDirectory $APP_FOLDER
 
     Write-Host "================================================================"
     Write-Host "   INSTALACAO CONCLUIDA!"
@@ -790,11 +897,8 @@ function Set-DestinationFolder {
         return
     }
 
-    $pastaAtual = $null
-    if (Test-Path $CONFIG_FILE) {
-        $linha = Get-Content $CONFIG_FILE -Encoding UTF8 | Where-Object { $_ -like "SaveFolder=*" }
-        if ($linha) { $pastaAtual = $linha -replace "^SaveFolder=", "" }
-    }
+    $cfgAtual = Import-AppConfig
+    $pastaAtual = $cfgAtual.SaveFolder
     if ($pastaAtual) {
         Write-Host "Pasta atual configurada: $pastaAtual"
     } else {
@@ -815,10 +919,11 @@ function Set-DestinationFolder {
 
     $novaPasta = $picker.SelectedPath
     try {
-        Set-ConfigValue -Key "SaveFolder" -Value $novaPasta
-        Write-Host "[OK] config.ini atualizado com sucesso" -ForegroundColor Green
+        $cfgAtual.SaveFolder = $novaPasta
+        Save-AppConfig -Config $cfgAtual
+        Write-Host "[OK] config.json atualizado com sucesso" -ForegroundColor Green
     } catch {
-        Write-Host "[ERRO] Nao foi possivel gravar o config.ini: $_" -ForegroundColor Red
+        Write-Host "[ERRO] Nao foi possivel gravar o config.json: $_" -ForegroundColor Red
         Read-Host "Pressione Enter para sair"
         return
     }
@@ -839,14 +944,13 @@ function Set-NamePattern {
         return
     }
 
-    $atual = Get-ConfigValue -Key "NamePatterns"
-    $listaAtual = @()
-    if ($atual) { $listaAtual = @($atual -split '\|\|\|') }
-    $pesquisavelAtual = (Get-ConfigValue -Key "SearchablePdf") -eq "1"
+    $cfgNomes = Import-AppConfig
+    $listaAtual = @($cfgNomes.NamePatterns)
+    $pesquisavelAtual = [bool]$cfgNomes.SearchablePdf
 
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = "Configurar Nome Automatico e OCR dos PDFs"
-    $dlg.Size = New-Object System.Drawing.Size(460, 470)
+    $dlg.ClientSize = New-Object System.Drawing.Size(460, 430)
     $dlg.StartPosition = "CenterScreen"
     $dlg.FormBorderStyle = "FixedDialog"
     $dlg.MaximizeBox = $false
@@ -901,8 +1005,9 @@ function Set-NamePattern {
 
     if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         $novaLista = @($txt.Text -split "`r`n|`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
-        Set-ConfigValue -Key "NamePatterns" -Value ($novaLista -join '|||')
-        Set-ConfigValue -Key "SearchablePdf" -Value $(if ($chkPesquisavel.Checked) { "1" } else { "0" })
+        $cfgNomes.NamePatterns = $novaLista
+        $cfgNomes.SearchablePdf = [bool]$chkPesquisavel.Checked
+        Save-AppConfig -Config $cfgNomes
 
         $msg = @()
         if ($novaLista.Count -gt 0) {
@@ -954,7 +1059,6 @@ function Uninstall-Printer {
     Write-Host ""
 
     Write-Host "[3/5] Removendo inicializacao automatica..."
-    Unregister-ScheduledTask -TaskName 'Monitor PDF Virtual' -Confirm:$false -ErrorAction SilentlyContinue
     $wsh = New-Object -ComObject WScript.Shell
     $startupFolder = $wsh.SpecialFolders('AllUsersStartup')
     $shortcutPath = Join-Path $startupFolder 'Monitor PDF Virtual.lnk'
@@ -991,9 +1095,14 @@ if ($Action -eq 'Uninstall') { Uninstall-Printer; exit }
 if ($Action -eq 'NamePattern') { Set-NamePattern; exit }
 
 # --- Interface grafica principal ---
+$formWidth   = 420
+$margemX     = 20
+$larguraBtn  = 360
+$espacamento = 12
+$y = 20
+
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Impressora PDF Virtual"
-$form.Size = New-Object System.Drawing.Size(420, 420)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
@@ -1002,75 +1111,63 @@ $titulo = New-Object System.Windows.Forms.Label
 $titulo.Text = "Impressora PDF Virtual"
 $titulo.Font = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
 $titulo.AutoSize = $true
-$titulo.Location = New-Object System.Drawing.Point(20, 20)
+$titulo.Location = New-Object System.Drawing.Point($margemX, $y)
 $form.Controls.Add($titulo)
+$y += $titulo.PreferredHeight + 8
 
 $subtitulo = New-Object System.Windows.Forms.Label
 $subtitulo.Text = "Escolha uma opcao:"
 $subtitulo.AutoSize = $true
-$subtitulo.Location = New-Object System.Drawing.Point(20, 55)
+$subtitulo.Location = New-Object System.Drawing.Point($margemX, $y)
 $form.Controls.Add($subtitulo)
+$y += $subtitulo.PreferredHeight + 20
 
-$btnInstalar = New-Object System.Windows.Forms.Button
-$btnInstalar.Text = "Instalar / Reinstalar Impressora"
-$btnInstalar.Size = New-Object System.Drawing.Size(360, 45)
-$btnInstalar.Location = New-Object System.Drawing.Point(20, 90)
-$btnInstalar.Add_Click({
+function Add-PanelButton {
+    param($Texto, $Altura, $OnClick)
+    $script:btn = New-Object System.Windows.Forms.Button
+    $btn.Text = $Texto
+    $btn.Size = New-Object System.Drawing.Size($larguraBtn, $Altura)
+    $btn.Location = New-Object System.Drawing.Point($margemX, $y)
+    $btn.Add_Click($OnClick)
+    $form.Controls.Add($btn)
+    $script:y += $Altura + $espacamento
+    return $btn
+}
+
+Add-PanelButton -Texto "Instalar / Reinstalar Impressora" -Altura 45 -OnClick {
     $form.Hide()
     Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Install" -Wait
     $form.Show()
-})
-$form.Controls.Add($btnInstalar)
+} | Out-Null
 
-$btnAlterar = New-Object System.Windows.Forms.Button
-$btnAlterar.Text = "Alterar Pasta de Destino"
-$btnAlterar.Size = New-Object System.Drawing.Size(360, 45)
-$btnAlterar.Location = New-Object System.Drawing.Point(20, 145)
-$btnAlterar.Add_Click({
+Add-PanelButton -Texto "Alterar Pasta de Destino" -Altura 45 -OnClick {
     $form.Hide()
     Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action AlterarPasta" -Wait
     $form.Show()
-})
-$form.Controls.Add($btnAlterar)
+} | Out-Null
 
-$btnNomePattern = New-Object System.Windows.Forms.Button
-$btnNomePattern.Text = "Configurar Nome Automatico e OCR"
-$btnNomePattern.Size = New-Object System.Drawing.Size(360, 45)
-$btnNomePattern.Location = New-Object System.Drawing.Point(20, 200)
-$btnNomePattern.Add_Click({
+Add-PanelButton -Texto "Configurar Nome Automatico e OCR" -Altura 45 -OnClick {
     $form.Hide()
     Set-NamePattern
     $form.Show()
-})
-$form.Controls.Add($btnNomePattern)
+} | Out-Null
 
-$btnFolderRules = New-Object System.Windows.Forms.Button
-$btnFolderRules.Text = "Configurar Pastas por Valor Extraido"
-$btnFolderRules.Size = New-Object System.Drawing.Size(360, 45)
-$btnFolderRules.Location = New-Object System.Drawing.Point(20, 255)
-$btnFolderRules.Add_Click({
+Add-PanelButton -Texto "Configurar Pastas por Valor Extraido" -Altura 45 -OnClick {
     $form.Hide()
     Set-FolderRoutingRules
     $form.Show()
-})
-$form.Controls.Add($btnFolderRules)
+} | Out-Null
 
-$btnDesinstalar = New-Object System.Windows.Forms.Button
-$btnDesinstalar.Text = "Desinstalar"
-$btnDesinstalar.Size = New-Object System.Drawing.Size(360, 45)
-$btnDesinstalar.Location = New-Object System.Drawing.Point(20, 310)
-$btnDesinstalar.Add_Click({
+Add-PanelButton -Texto "Desinstalar" -Altura 45 -OnClick {
     $form.Hide()
     Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action Uninstall" -Wait
     $form.Show()
-})
-$form.Controls.Add($btnDesinstalar)
+} | Out-Null
 
-$btnSair = New-Object System.Windows.Forms.Button
-$btnSair.Text = "Sair"
-$btnSair.Size = New-Object System.Drawing.Size(360, 30)
-$btnSair.Location = New-Object System.Drawing.Point(20, 360)
-$btnSair.Add_Click({ $form.Close() })
-$form.Controls.Add($btnSair)
+$y += 6
+Add-PanelButton -Texto "Sair" -Altura 32 -OnClick { $form.Close() } | Out-Null
+
+$y += 12
+$form.ClientSize = New-Object System.Drawing.Size($formWidth, $y)
 
 [void]$form.ShowDialog()
